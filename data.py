@@ -151,7 +151,82 @@ class Vocabulary:
     def numericalize(self, text):
         tokenized_text = self.tokenize(text)
         return [self.stoi.get(token, self.stoi["<UNK>"]) for token in tokenized_text]
-    
+
+import os
+from pathlib import Path
+from PIL import Image
+from torch.utils.data import Dataset
+import torchvision.transforms as T
+
+class CROHMEDataset(Dataset):
+    def __init__(
+        self,
+        root_dir: str,
+        image_size=(256, 1024),  # (H, W)
+        samples: list[str] | None = None,
+    ):
+        self.root_dir = Path(root_dir)
+
+        if samples is None:
+            self.samples = sorted([
+                p.stem.replace(".inkml", "")
+                for p in self.root_dir.glob("*.inkml.png")
+            ])
+        else:
+            self.samples = samples
+
+        self.transform = T.Compose([
+            T.Resize(image_size, antialias=True),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5], std=[0.5])  # grayscale-friendly
+        ])
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        name = self.samples[idx]
+
+        img_path = self.root_dir / f"{name}.inkml.png"
+        txt_path = self.root_dir / f"{name}.txt"
+
+        # image
+        img = Image.open(img_path).convert("L")  # grayscale
+        img = self.transform(img)
+
+        # latex
+        with open(txt_path, "r", encoding="utf-8") as f:
+            latex = f.readline().strip()
+
+        return {
+            "image": img,          # Tensor [1, H, W]
+            "latex": latex,        # str
+            "id": name
+        }
+        
+        
+import torch
+from torch.nn.utils.rnn import pad_sequence
+
+def encode_batch(latex_list, vocab, device="cpu"):
+    """
+    Превращает список LaTeX-строк в тензор с padding:
+    [batch, max_len]
+    """
+    sequences = []
+
+    for latex in latex_list:
+        tokens = vocab.tokenize(latex)
+        ids = [vocab.stoi.get(t, vocab.stoi["<UNK>"]) for t in tokens]
+        seq = [vocab.stoi["<SOS>"]] + ids + [vocab.stoi["<EOS>"]]
+        sequences.append(torch.tensor(seq, dtype=torch.long))
+
+    # Padding
+    batch_tensor = pad_sequence(sequences, batch_first=True, padding_value=vocab.stoi["<PAD>"])
+    return batch_tensor.to(device)
+
+
+
 if __name__ == "__main__":
     image = inkml_to_image("image\\105_em_88.inkml")
     image.save("sample_image.png")
