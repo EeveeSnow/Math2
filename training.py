@@ -195,7 +195,7 @@ def train():
         corpus.append(txt.read_text().strip())
 
     vocab.build_vocab(corpus)
-
+    
     model = Im2LatexModel(len(vocab)).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, EPOCHS)

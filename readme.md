@@ -1,4 +1,5 @@
 **init**
+
 ```bash
     python3 -m venv venv
     source venv/bin/activate   
@@ -17,10 +18,17 @@ if using cpu
 ```
 
 ```bash
-    pip install timm pathlib split_utils tqdm
+    pip install timm pathlib split_utils tqdm gradio
 ```
 
 **Training**
+
 ```bash
     python training.py
+```
+
+**Interface**
+
+```bash
+    python app.py
 ```
