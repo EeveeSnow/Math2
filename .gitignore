@@ -5,3 +5,4 @@ CROHME_processed
 __pycache__
 *.csv
 version1_learner.zip
+.gradio/certificate.pem
