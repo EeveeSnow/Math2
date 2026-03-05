@@ -18,7 +18,7 @@ if using cpu
 ```
 
 ```bash
-    pip install timm pathlib split_utils tqdm gradio
+    pip install timm pathlib tqdm gradio datasets
 ```
 
 **Training**

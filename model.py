@@ -2,36 +2,65 @@ import torch
 import torch.nn as nn
 import timm
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+
+
 class SwinEncoder(nn.Module):
-    def __init__(self, d_model=512):
+    def __init__(self, d_model=512, swin_model="swin_base_patch4_window12_384"):
         super().__init__()
+
+        # Create Swin backbone
         self.backbone = timm.create_model(
-            "swin_base_patch4_window7_224",
+            swin_model,
             pretrained=True,
             features_only=True,
-            in_chans=1
+            in_chans=1,
+            img_size=(384, 384),
+            dynamic_img_size=True
         )
-        # 1024 dim -> 512 dim
-        self.proj = nn.Linear(1024, d_model)
+
+        # Dynamically determine channels of stage3 and stage4
+        ch3 = self.backbone.feature_info.channels()[-2]  # stage3
+        ch4 = self.backbone.feature_info.channels()[-1]  # stage4
+        self.in_ch = ch3 + ch4
+
+        self.proj = nn.Linear(self.in_ch, d_model)
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x):
-        feats = self.backbone(x)[-1]
-        
-        if feats.shape[1] == 1024:
-            # NCHW -> NHWC
-            feats = feats.permute(0, 2, 3, 1)
-        B, H, W, C = feats.shape
-        
-        # (B, H, W, 1024) -> (B, H, W, 512)
-        feats = self.proj(feats)
-        
-        # (B, H*W, 512)
-        feats = feats.flatten(1, 2)
-        
-        return feats, (H, W)
+        feats = self.backbone(x)
+
+        # stage3 and stage4 features
+        f3 = feats[-2]  # (B, C3, H3, W3)
+        f4 = feats[-1]  # (B, C4, H4, W4)
+        f3 = f3.permute(0, 3, 2, 1)
+        f4 = f4.permute(0, 3, 2, 1)
+        B, C4, H4, W4 = f4.shape
+
+        # Upsample f3 до разрешения f4 (NCHW!)
+        f3 = F.interpolate(f3, size=(H4, W4), mode="bilinear", align_corners=False)  # NCHW
+        # Теперь f3: (B, C3, H4, W4)
+        # Переводим в NHWC для concat
+        f3 = f3.permute(0, 2, 3, 1)  # (B, H4, W4, C3)
+        f4 = f4.permute(0, 2, 3, 1)  # (B, H4, W4, C4)
+        # Конкатенация по каналам
+        f = torch.cat([f3, f4], dim=-1)  # (B, H4, W4, C3+C4)
+
+        # Проекция
+        f = self.proj(f)  # (B, H4, W4, d_model)
+        # print("After proj:", f.shape)  # (16, 12, 12, 512)
+
+        # Flatten
+        f = f.view(B, -1, f.shape[-1])  # (B, H4*W4, d_model)
+        f = self.norm(f)
+
+        return f, (H4, W4)    
 
 class GatedConvBlock(nn.Module):
-    def __init__(self, d_model, kernel_size=7):
+    def __init__(self, d_model, kernel_size=15):
         super().__init__()
         self.conv = nn.Conv1d(
             d_model,
@@ -93,35 +122,42 @@ class HybridDecoder(nn.Module):
         return self.fc(x)
 
 class Pos2D(nn.Module):
-    def __init__(self, max_h=50, max_w=50, d_model=512):
+    def __init__(self, d_model=512):
         super().__init__()
-        self.x_embed = nn.Embedding(max_w, d_model // 2)
-        self.y_embed = nn.Embedding(max_h, d_model // 2)
+        # We'll split d_model equally between height and width embeddings
+        self.d_model = d_model
 
     def forward(self, H, W, device):
-        y = torch.arange(H, device=device)
-        x = torch.arange(W, device=device)
+        # Dynamic embeddings based on H and W
+        d_half = self.d_model // 2
 
-        pos_y = self.y_embed(y)
-        pos_x = self.x_embed(x)
+        # Learnable embeddings for height and width
+        y_embed = nn.Parameter(torch.randn(H, d_half, device=device))
+        x_embed = nn.Parameter(torch.randn(W, d_half, device=device))
 
+        # Expand and combine
         pos = torch.cat([
-            pos_y[:, None, :].expand(H, W, -1),
-            pos_x[None, :, :].expand(H, W, -1)
-        ], dim=-1)
+            y_embed[:, None, :].expand(H, W, -1),  # (H, W, d/2)
+            x_embed[None, :, :].expand(H, W, -1)   # (H, W, d/2)
+        ], dim=-1)  # (H, W, d_model)
 
-        return pos.reshape(H * W, -1)
+        return pos.reshape(H * W, self.d_model)  # Flatten to (H*W, d_model)
+    
 
 class Im2LatexModel(nn.Module):
-    def __init__(self, vocab_size, d_model=512):
+    def __init__(self, vocab_size, d_model=512, decoder_depth=6, max_len=512):
         super().__init__()
         self.encoder = SwinEncoder(d_model)
-        self.decoder = HybridDecoder(vocab_size, d_model)
-        self.pos_enc = Pos2D(d_model=d_model)
+        self.decoder = HybridDecoder(vocab_size, d_model, depth=decoder_depth, max_len=max_len)
+        self.d_model = d_model
 
     def forward(self, images, tgt):
         memory, (H, W) = self.encoder(images)
-        pos_embeddings = self.pos_enc(H, W, images.device)
-        memory = memory + pos_embeddings.unsqueeze(0)
-        
+
+        # Dynamic positional embeddings
+        device = images.device
+        pos_embeddings = Pos2D(d_model=self.d_model)(H, W, device)
+        memory = memory + pos_embeddings.unsqueeze(0)  # (1, H*W, d_model) -> broadcast to batch
+
+        # Pass to decoder
         return self.decoder(memory, tgt), (H, W)
