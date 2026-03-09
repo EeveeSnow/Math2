@@ -1,6 +1,11 @@
 import json
 import os
+
 import sys
+import re
+import wraper 
+sys.modules['data'] = wraper 
+
 import tempfile
 from datetime import datetime
 
@@ -13,6 +18,7 @@ from torchvision import transforms
 import wraper
 from interface import beam_search, decode_tokens, predict_latex
 from metrics import avg_edit_distance, exact_match, token_accuracy
+from image_processing import RandomWidth, ResizePadHW
 from model import Im2LatexModel
 from wraper import encode_batch
 
@@ -35,16 +41,22 @@ model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
 image_transform = transforms.Compose([
-    transforms.Grayscale(num_output_channels=1),
-    transforms.Resize((384, 384)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5], std=[0.5]),
-])
+            transforms.Grayscale(),
+            RandomWidth(),
+            ResizePadHW(*(384, 384)),
+            transforms.ToTensor()])
 
 
 def process_image(img):
     return predict_latex(img, model, DEVICE, vocab)
 
+
+def normalize_latex(s):
+    s = s.replace(" ", "") # Remove spaces
+    s = s.replace("_{o}", "_{0}") # Map letter 'o' to zero
+    s = re.sub(r'_([a-zA-Z0-9])(?![a-zA-Z0-9])', r'_{\1}', s) # x_2 to x_{2}
+    s = re.sub(r'\^([a-zA-Z0-9])(?![a-zA-Z0-9])', r'^{\1}', s) # x^2 to x^{2}
+    return s
 
 def _bucket_name(length):
     if length <= 20:
@@ -115,8 +127,8 @@ def run_test_dataset(max_samples, batch_size, progress=gr.Progress(track_tqdm=Tr
     split_name = "test" if max_samples <= 0 else f"test[:{max_samples}]"
     ds = load_dataset("deepcopy/MathWriting-Human", split=split_name)
 
-    pred_batches = []
-    tgt_batches = []
+    all_pred_texts = []
+    all_gt_texts = []
     items = []
     bucket_raw = {"<=20": [], "21-40": [], "41-80": [], ">80": []}
 
@@ -137,8 +149,8 @@ def run_test_dataset(max_samples, batch_size, progress=gr.Progress(track_tqdm=Tr
             pred_texts.append(pred_text)
 
             gt = gt_texts[local_idx]
-            gt_len = len(gt.split())
-            pred_len = len(pred_text.split())
+            gt_len = len(''.join(gt.split()))
+            pred_len = len(''.join(pred_text.split()))
             p_tensor = encode_batch([pred_text], vocab_obj)
             t_tensor = encode_batch([gt], vocab_obj)
             ed = avg_edit_distance(p_tensor, t_tensor)
@@ -160,14 +172,14 @@ def run_test_dataset(max_samples, batch_size, progress=gr.Progress(track_tqdm=Tr
                 }
             )
 
-        pred_batches.append(encode_batch(pred_texts, vocab_obj))
-        tgt_batches.append(encode_batch(gt_texts, vocab_obj))
+    all_pred_texts.extend(pred_texts)
+    all_gt_texts.extend(gt_texts)
 
-    pred_tensor = torch.cat(pred_batches, dim=0)
-    tgt_tensor = torch.cat(tgt_batches, dim=0)
+    pred_tensor = encode_batch(all_pred_texts, vocab_obj)
+    tgt_tensor = encode_batch(all_gt_texts, vocab_obj)
 
     token_acc = token_accuracy(pred_tensor, tgt_tensor)
-    em_score = exact_match(pred_tensor, tgt_tensor)
+    em_score = 0
     edit_score = avg_edit_distance(pred_tensor, tgt_tensor)
 
     norm_ed = 0.0
@@ -185,11 +197,13 @@ def run_test_dataset(max_samples, batch_size, progress=gr.Progress(track_tqdm=Tr
         if not values:
             bucket_stats[bucket] = {"exact_match": 0.0, "avg_edit_distance": 0.0}
         else:
+            print(f"{bucket} : {len(values)}" )
             bucket_stats[bucket] = {
                 "exact_match": sum(v["exact_match"] for v in values) / len(values),
                 "avg_edit_distance": sum(v["edit_distance"] for v in values) / len(values),
             }
-
+            em_score += sum(v["exact_match"] for v in values)
+    em_score /= len(items)
     log_data = {
         "created_at": datetime.utcnow().isoformat(),
         "metrics": {
