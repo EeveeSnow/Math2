@@ -1,10 +1,21 @@
 import torch
 from torch.nn.utils.rnn import pad_sequence
+from image_processing import RandomWidth, ResizePadHW
+from torchvision import transforms
+
 
 PAD = 0
 SOS = 1
 EOS = 2
-MAX_LEN = 150
+MAX_LEN = 150    
+
+image_transform = transforms.Compose([
+            transforms.Grayscale(),
+            RandomWidth(),
+            ResizePadHW(*(384, 384)),
+            transforms.ToTensor()
+        ])
+
 
 @torch.no_grad()
 def greedy_decode(model, images, max_len=MAX_LEN):
@@ -33,8 +44,8 @@ def beam_search(model, images, beam_size=5, max_len=MAX_LEN, length_penalty=0.7)
     B = images.size(0)
 
     memory, (H, W) = model.encoder(images)
-    pos = model.pos_enc(H, W, device)
-    memory = memory + pos.unsqueeze(0)
+    pos = model.pos_encoder(H, W, device)
+    memory = memory + pos
 
     beams = [[(torch.tensor([SOS], device=device), 0.0)] for _ in range(B)]
     finished = [[] for _ in range(B)]
@@ -75,13 +86,30 @@ def beam_search(model, images, beam_size=5, max_len=MAX_LEN, length_penalty=0.7)
     return pad_sequence(results, batch_first=True, padding_value=PAD)
 
 
-def decode_tokens(IDX2TOKEN, token_ids):
-    """Converts a list of token IDs back into a LaTeX string."""
+def decode_tokens(vocab_obj, token_ids):
+    itos = vocab_obj
     latex = []
     for tid in token_ids:
-        tid = tid.item()
-        if tid == EOS:
+        tid = tid.item() if hasattr(tid, 'item') else int(tid)
+        
+        if tid == 2:
             break
-        if tid not in [PAD, SOS]:
-            latex.append(IDX2TOKEN.get(tid, ""))
+            
+        if tid not in [0, 1, 3]: 
+            token_str = itos.get(tid, "")
+            latex.append(str(token_str))
+            
     return " ".join(latex)
+
+def predict_latex(image, model, DEVICE, vocab):
+    if image is None:
+        return "", ""
+    
+    img_tensor = image_transform(image).unsqueeze(0).to(DEVICE)
+    prediction = beam_search(model, img_tensor, beam_size=3)
+    print(prediction)
+    latex_str = decode_tokens(vocab, prediction[0])
+    print(latex_str)
+    rendered_math = f"$$ {latex_str} $$"
+    
+    return latex_str, rendered_math
