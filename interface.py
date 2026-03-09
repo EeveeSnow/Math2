@@ -38,7 +38,9 @@ def greedy_decode(model, images, max_len=MAX_LEN):
     return out[:, 1:]
     
 @torch.no_grad()
-def beam_search(model, images, beam_size=5, max_len=MAX_LEN, length_penalty=0.7):
+def beam_search(model, images, beam_size=5, max_len=MAX_LEN, length_penalty=0.7, num_return_sequences=3):
+    num_return_sequences = min(num_return_sequences, beam_size)
+    
     model.eval()
     device = images.device
     B = images.size(0)
@@ -48,7 +50,7 @@ def beam_search(model, images, beam_size=5, max_len=MAX_LEN, length_penalty=0.7)
     memory = memory + pos
 
     beams = [[(torch.tensor([SOS], device=device), 0.0)] for _ in range(B)]
-    finished = [[] for _ in range(B)]
+    finished =[[] for _ in range(B)]
 
     for _ in range(max_len):
         new_beams = [[] for _ in range(B)]
@@ -77,13 +79,30 @@ def beam_search(model, images, beam_size=5, max_len=MAX_LEN, length_penalty=0.7)
         if all(len(finished[b]) >= beam_size for b in range(B)):
             break
 
-    results = []
+    flat_results =[]
+    
     for b in range(B):
         candidates = finished[b] if finished[b] else beams[b]
-        best = max(candidates, key=lambda x: x[1] / (len(x[0]) ** length_penalty))[0]
-        results.append(best[1:])
+        
+        sorted_candidates = sorted(
+            candidates, 
+            key=lambda x: x[1] / (len(x[0]) ** length_penalty), 
+            reverse=True
+        )
+        
+        for i in range(num_return_sequences):
+            if i < len(sorted_candidates):
+                seq = sorted_candidates[i][0]
+            else:
+                seq = sorted_candidates[-1][0] 
+                
+            flat_results.append(seq[1:])
 
-    return pad_sequence(results, batch_first=True, padding_value=PAD)
+    padded = pad_sequence(flat_results, batch_first=True, padding_value=PAD)
+    
+    final_results = padded.view(B, num_return_sequences, -1)
+
+    return final_results
 
 
 def decode_tokens(vocab_obj, token_ids):
@@ -106,10 +125,9 @@ def predict_latex(image, model, DEVICE, vocab):
         return "", ""
     
     img_tensor = image_transform(image).unsqueeze(0).to(DEVICE)
-    prediction = beam_search(model, img_tensor, beam_size=3)
-    print(prediction)
-    latex_str = decode_tokens(vocab, prediction[0])
+    predictions = beam_search(model, img_tensor, beam_size=3)
+    latex_str = [decode_tokens(vocab, predictions[0][0]), decode_tokens(vocab, predictions[0][1]), decode_tokens(vocab, predictions[0][2])]
     print(latex_str)
-    rendered_math = f"$$ {latex_str} $$"
-    
+    rendered_math = f"$$ {latex_str[0]} $$\n$$ {latex_str[1]} $$\n$$ {latex_str[2]} $$"
+    latex_str = '\n'.join(latex_str)
     return latex_str, rendered_math
