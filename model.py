@@ -137,7 +137,7 @@ class Pos2D(nn.Module):
         return pos.view(1, H * W, -1) # (1, H*W, D)
     
 
-class Im2LatexModel(nn.Module):
+class SwiGLiT(nn.Module):
     def __init__(self, vocab_size, d_model=512, decoder_depth=6, max_len=512):
         super().__init__()
         self.encoder = SwinEncoder(d_model)

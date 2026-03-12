@@ -9,8 +9,13 @@ from pathlib import Path
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 
-from model import Im2LatexModel
+from model_mamba import Im2LatexModel
 from wraper import MathWritingDataset, Vocabulary, encode_batch
+
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "./torch_compile_cache"
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 # ======================
 # CONFIG
@@ -58,6 +63,17 @@ def mix_inputs(gt_tokens, pred_tokens, p):
     mask = (torch.rand_like(gt_tokens.float()) < p)
     return torch.where(mask, pred_tokens, gt_tokens)
 
+# def collate_fn(batch):
+#     images = torch.stack([item["image"] for item in batch])
+#     latexs = [item["latex"] for item in batch]
+#     captions = pad_sequence([item["captions"] for item in batch], batch_first=True, padding_value=0)
+    
+#     return {
+#         "image": images,
+#         "latex": latexs,
+#         "captions": captions
+#     }
+
 # ======================
 # TRAIN
 # ======================
@@ -68,8 +84,8 @@ def train():
     train_dataset = MathWritingDataset(ds["train"], image_size=(384, 384))
     val_dataset = MathWritingDataset(ds["val"], image_size=(384, 384))
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=12, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=12, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=12, pin_memory=True, persistent_workers=True, prefetch_factor=8)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=12, pin_memory=True, persistent_workers=True, prefetch_factor=8)
 
     start_epoch = 1
     best_val_loss = float('inf')
@@ -80,7 +96,8 @@ def train():
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
         vocab = checkpoint['vocab']
         model = Im2LatexModel(len(vocab)).to(DEVICE)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+        model = torch.compile(model)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR, fused=True)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_updates)
         
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -95,11 +112,11 @@ def train():
         vocab = Vocabulary(freq_threshold=2)
         vocab.build_vocab([sample["latex"] for sample in ds["train"]])
         model = Im2LatexModel(len(vocab)).to(DEVICE)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+        model = torch.compile(model)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR, fused=True)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_updates)
 
         
-
     criterion = nn.CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.1)
     scaler = GradScaler()
 

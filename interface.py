@@ -124,7 +124,7 @@ def predict_latex(image, model, DEVICE, vocab):
     if image is None:
         return "", ""
     
-    img_tensor = image_transform(image).unsqueeze(0).to(DEVICE)
+    img_tensor = image_transform(image).unsqueeze(0).to(DEVICE).half()
     predictions = beam_search(model, img_tensor, beam_size=3)
     latex_str = [decode_tokens(vocab, predictions[0][0]), decode_tokens(vocab, predictions[0][1]), decode_tokens(vocab, predictions[0][2])]
     print(latex_str)

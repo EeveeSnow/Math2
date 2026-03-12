@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
-import timm
-
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import timm
+
+from mamba_ssm import Mamba2
 
 
 class SwinEncoder(nn.Module):
@@ -106,17 +104,34 @@ class DecoderBlock(nn.Module):
 class MambaDecoderBlock(nn.Module):
     def __init__(self, d_model=512):
         super().__init__()
-        self.ssm = Mamba2(
+
+
+        self.ssm1 = Mamba2(
             d_model=d_model,
             d_state=64,
             d_conv=4,
             expand=2
         )
 
-        self.cross_attn = nn.MultiheadAttention(
-            d_model,
-            8,
-            batch_first=True
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.nhead = 8
+        self.head_dim = d_model // self.nhead
+
+        # self.cross_attn = nn.MultiheadAttention(
+        #     d_model,
+        #     8,
+        #     batch_first=True
+        # )
+
+        self.ssm2 = Mamba2(
+            d_model=d_model,
+            d_state=64,
+            d_conv=4,
+            expand=2
         )
 
         self.ffn = nn.Sequential(
@@ -128,13 +143,36 @@ class MambaDecoderBlock(nn.Module):
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
         self.ln3 = nn.LayerNorm(d_model)
+        self.ln4 = nn.LayerNorm(d_model)
+
+
+    def cross_attention(self, x, memory):
+        B, T, C = x.shape
+        S = memory.shape[1]
+
+        q = self.q_proj(x)
+        k = self.k_proj(memory)
+        v = self.v_proj(memory)
+
+        q = q.view(B, T, self.nhead, self.head_dim).transpose(1,2)
+        k = k.view(B, S, self.nhead, self.head_dim).transpose(1,2)
+        v = v.view(B, S, self.nhead, self.head_dim).transpose(1,2)
+
+        attn = F.scaled_dot_product_attention(
+            q, k, v
+        )
+
+        attn = attn.transpose(1,2).reshape(B, T, C)
+
+        return self.out_proj(attn)
 
 
     def forward(self, x, memory):
-        x = x + self.ssm(self.ln1(x))
-        attn, _ = self.cross_attn(self.ln2(x), memory, memory)
+        x = x + self.ssm1(self.ln1(x))
+        attn = self.cross_attention(self.ln2(x), memory)
         x = x + attn
-        x = x + self.ffn(self.ln3(x))
+        x = x + self.ssm2(self.ln3(x))
+        x = x + self.ffn(self.ln4(x))
         return x
 
 
@@ -179,7 +217,7 @@ class Pos2D(nn.Module):
         return pos.view(1, H * W, -1)
     
 
-class Im2LatexModel(nn.Module):
+class SwinMambaTex(nn.Module):
     def __init__(self, vocab_size, d_model=512, decoder_depth=6, max_len=512):
         super().__init__()
         self.encoder = SwinEncoder(d_model)
