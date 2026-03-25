@@ -49,16 +49,32 @@ def exact_match(pred, tgt):
     return matches / len(pred)
 
 
-def levenshtein(a, b):
-    dp = [[i + j if i * j == 0 else 0 for j in range(len(b)+1)] for i in range(len(a)+1)]
-    for i in range(1, len(a)+1):
-        for j in range(1, len(b)+1):
+def levenshtein(seq1, seq2):
+    m = len(seq1)
+    n = len(seq2)
+
+    dp = [[0]*(n+1) for _ in range(m+1)]
+
+    for i in range(m+1):
+        dp[i][0] = i
+    for j in range(n+1):
+        dp[0][j] = j
+
+    for i in range(1, m+1):
+        for j in range(1, n+1):
+
+            if seq1[i-1] == seq2[j-1]:
+                cost = 0
+            else:
+                cost = 1
+
             dp[i][j] = min(
                 dp[i-1][j] + 1,
                 dp[i][j-1] + 1,
-                dp[i-1][j-1] + (a[i-1] != b[j-1])
+                dp[i-1][j-1] + cost
             )
-    return dp[-1][-1]
+
+    return dp[m][n]
 
 
 def avg_edit_distance(pred, tgt):

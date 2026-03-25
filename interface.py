@@ -2,7 +2,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from image_processing import RandomWidth, ResizePadHW
 from torchvision import transforms
-
+import re
 
 PAD = 0
 SOS = 1
@@ -107,25 +107,45 @@ def beam_search(model, images, beam_size=5, max_len=MAX_LEN, length_penalty=0.7,
 
 def decode_tokens(vocab_obj, token_ids):
     itos = vocab_obj
-    latex = []
+    latex = ""
+    
     for tid in token_ids:
         tid = tid.item() if hasattr(tid, 'item') else int(tid)
         
         if tid == 2:
             break
             
-        if tid not in [0, 1, 3]: 
-            token_str = itos.get(tid, "")
-            latex.append(str(token_str))
+        if tid not in [0, 1, 3]:
+            token_str = str(itos.get(tid, ""))
             
-    return " ".join(latex)
+
+            if token_str.startswith("\\"):
+                latex += token_str + " "
+            else:
+                latex += token_str
+    
+    latex = re.sub(r'(\\[a-zA-Z]+)\s+([^a-zA-Z])', r'\1\2', latex)
+    
+    latex = re.sub(r'(\\[a-zA-Z]+)\s+([^a-zA-Z])', r'\1\2', latex)
+    
+    return latex.strip()
 
 def predict_latex(image, model, DEVICE, vocab):
     if image is None:
         return "", ""
     
-    img_tensor = image_transform(image).unsqueeze(0).to(DEVICE).half()
-    predictions = beam_search(model, img_tensor, beam_size=3)
+    
+    if DEVICE == torch.device("cuda"):
+        img_tensor = image_transform(image).unsqueeze(0).to(torch.bfloat16).cuda()
+    else:
+        img_tensor = image_transform(image).unsqueeze(0).to(DEVICE)
+
+    predictions = model.generate_beam_search(
+        images=img_tensor, 
+        start_token_id=1,
+        eos_token_id=2,
+        beam_size=3,
+        max_new_tokens=256)
     latex_str = [decode_tokens(vocab, predictions[0][0]), decode_tokens(vocab, predictions[0][1]), decode_tokens(vocab, predictions[0][2])]
     print(latex_str)
     rendered_math = f"$$ {latex_str[0]} $$\n$$ {latex_str[1]} $$\n$$ {latex_str[2]} $$"

@@ -2,6 +2,7 @@
 venv
 CROHME_processed
 *.pt
+*.safetensors
 __pycache__
 *.csv
 version1_learner.zip

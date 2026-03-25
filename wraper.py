@@ -56,8 +56,8 @@ class Vocabulary:
         return len(self.itos)
 
     def tokenize(self, text):
-        # Better tokenization for LaTeX: split on spaces, but keep commands together
-        tokens = re.findall(r'\\[a-zA-Z]+|[a-zA-Z]+|\d+|[{}()=+\-*/^_]', text)
+        regex_pattern = r'\\[a-zA-Z]+|\\[^\s]|[^\s]'
+        tokens = re.findall(regex_pattern, text)
         return tokens
 
     def build_vocab(self, sentence_list):

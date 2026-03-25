@@ -3,11 +3,11 @@ from safetensors.torch import save_file
 import json
 import wraper
 
-ckpt = torch.load("checkpoints/best_model.pt", map_location="cpu",weights_only=False)
+ckpt = torch.load("checkpoints/last_checkpoint.pt", map_location="cpu",weights_only=False)
 
 state_dict = ckpt["model_state_dict"]
 print(len(state_dict), "original keys")
-state_dict_fp16 = {}
+state_dict_bf16 = {}
 
 state_dict = {
     k.replace("_orig_mod.", ""): v
@@ -17,13 +17,13 @@ state_dict = {
 for k, v in state_dict.items():
     if isinstance(v, torch.Tensor):
         if torch.is_floating_point(v):
-            state_dict_fp16[k] = v.to(torch.float16)
+            state_dict_bf16[k] = v.to(torch.bfloat16)
         else:
-            state_dict_fp16[k] = v
+            state_dict_bf16[k] = v
 
 vocab = ckpt["vocab"].itos
-print(len(state_dict_fp16), "tensor keys")
+print(len(state_dict_bf16), "tensor keys")
 with open("vocab.json", "w", encoding="utf-8") as f:
     json.dump(vocab, f, ensure_ascii=False, indent=2)
 # save
-save_file(state_dict_fp16, "model_fp16.safetensors")
+save_file(state_dict_bf16, "model_bf16.safetensors")
