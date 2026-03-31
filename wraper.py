@@ -51,16 +51,26 @@ class Vocabulary:
         self.itos = {0: "<PAD>", 1: "<SOS>", 2: "<EOS>", 3: "<UNK>"}
         self.stoi = {"<PAD>": 0, "<SOS>": 1, "<EOS>": 2, "<UNK>": 3}
         self.freq_threshold = freq_threshold
+        # self._COMMAND_RE = re.compile(r'\\(mathbb{[a-zA-Z]}|begin{[a-z]+}|end{[a-z]+}|operatorname\*|[a-zA-Z]+|.)')
+        self._COMMAND_RE = re.compile(
+        r'\\mathbb{[a-zA-Z]}'       
+        r'|\\mathcal{[a-zA-Z]}'
+        r'|\\begin{[a-zA-Z*]+}'
+        r'|\\end{[a-zA-Z*]+}'
+        r'|\\operatorname\*?'
+        r'|\\[a-zA-Z]+'
+        r'|\\.'
+        # r'|\d+(?:\.\d+)?'
+        r'|[^\s]')
+    
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.itos)
 
-    def tokenize(self, text):
-        regex_pattern = r'\\[a-zA-Z]+|\\[^\s]|[^\s]'
-        tokens = re.findall(regex_pattern, text)
-        return tokens
+    def tokenize(self, text: str) -> list[str]:
+        return self._COMMAND_RE.findall(text)
 
-    def build_vocab(self, sentence_list):
+    def build_vocab(self, sentence_list: list[str]) -> dict[int, str]:
         frequencies = {}
         idx = 4
 
@@ -76,6 +86,6 @@ class Vocabulary:
                     self.itos[idx] = word
                     idx += 1
 
-    def numericalize(self, text):
+    def numericalize(self, text: str) -> list[int]:
         tokenized_text = self.tokenize(text)
         return [self.stoi.get(token, self.stoi["<UNK>"]) for token in tokenized_text]

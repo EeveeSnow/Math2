@@ -18,7 +18,7 @@ if using cpu
 ```
 
 ```bash
-    pip install timm pathlib tqdm gradio datasets pandas nltk plotly
+    pip install timm pathlib tqdm gradio datasets pandas nltk plotly SymPy antlr4-python3-runtime
 ```
 
 only for mambda model

@@ -10,6 +10,8 @@ from functools import partial
 from metrics import levenshtein
 from typing import List
 from model_mamba_1layer import SwinMambaTex as Im2LatexModel
+# from model_conv import SwinGConvTex as Im2LatexModel
+# from model_transformer import SwinTransformerTex as Im2LatexModel
 from wraper import MathWritingDataset, Vocabulary, encode_batch
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = "./torch_compile_cache"
@@ -23,7 +25,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 12
 ACCUMULATION_STEPS = 4 
 EPOCHS = 20
-MAMBA_LR = 2e-4
+DECODER_LR = 2e-4
 SWIN_LR = 2e-5
 MIN_LR = 1e-6
 WARMUP_RATIO = 0.10  
@@ -31,8 +33,8 @@ MAX_LEN = 512
 SAVE_EVERY = 1
 CHECKPOINT_PATH = "checkpoints/last_checkpoint.pt"
 BEST_MODEL_PATH = "checkpoints/best_model.pt"
-LOG_FILE_STEP = "training_step_log.csv"
-LOG_FILE_EPOCH = "training_epoch_log.csv"
+LOG_FILE_STEP = "training_step_log_mamba.csv"
+LOG_FILE_EPOCH = "training_epoch_log_mamba.csv"
 LOG_STEP_INTERVAL = 100
 
 PAD = 0
@@ -94,7 +96,7 @@ def collate_fn(batch, vocab):
 def build_scheduler(optimizer, total_steps: int, warmup_steps: int):
     warm = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        start_factor = 1e-9 / MAMBA_LR,
+        start_factor = 1e-9 / DECODER_LR,
         end_factor   = 1.0,
         total_iters  = warmup_steps,
     )
@@ -163,8 +165,8 @@ def train():
         
         optimizer = torch.optim.AdamW([
             {"params": model.encoder.parameters(), "lr": SWIN_LR},
-            {"params": model.pos_encoder.parameters(), "lr": MAMBA_LR},
-            {"params": model.decoder.parameters(), "lr": MAMBA_LR},
+            {"params": model.pos_encoder.parameters(), "lr": DECODER_LR},
+            {"params": model.decoder.parameters(), "lr": DECODER_LR},
         ], weight_decay=0.05, fused=True)
 
         scheduler = build_scheduler(optimizer, total_updates, warmup_updates)
@@ -179,8 +181,8 @@ def train():
         model = torch.compile(model)
         optimizer = torch.optim.AdamW([
             {"params": model.encoder.parameters(), "lr": SWIN_LR},
-            {"params": model.pos_encoder.parameters(), "lr": MAMBA_LR},
-            {"params": model.decoder.parameters(), "lr": MAMBA_LR},
+            {"params": model.pos_encoder.parameters(), "lr": DECODER_LR},
+            {"params": model.decoder.parameters(), "lr": DECODER_LR},
         ], weight_decay=0.05, fused=True)
         scheduler = build_scheduler(optimizer, total_updates, warmup_updates)
 
@@ -189,6 +191,7 @@ def train():
     scaler = GradScaler(enabled=not USE_BFLOAT16)
 
     print(f"Vocab Size: {len(vocab)}")
+    print(vocab.itos)
     print(f"Training Steps per Epoch: {len(train_loader)}")
     print(f"Using AMP Dtype: {AMP_DTYPE}")
 
@@ -271,13 +274,13 @@ def train():
                 val_losses.append(v_loss.item())
 
                 if run_metrics:
-                    # TODO: generation on bf16 will be faster ??? 
-                    pred_tokens = model.generate(
-                        images,
-                        start_token_id = SOS,
-                        max_new_tokens = MAX_LEN,
-                        eos_token_id   = EOS,
-                    ).cpu()
+                    with torch.autocast("cuda", dtype=AMP_DTYPE):
+                        pred_tokens = model.generate(
+                            images,
+                            start_token_id = SOS,
+                            max_new_tokens = MAX_LEN,
+                            eos_token_id   = EOS,
+                        ).cpu()
                     captions_cpu = captions.cpu()
 
                     for pred, tgt in zip(pred_tokens, captions_cpu):

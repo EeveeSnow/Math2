@@ -4,7 +4,7 @@ import sys
 import re
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import nltk
@@ -26,8 +26,17 @@ from metrics import avg_edit_distance, exact_match, token_accuracy
 from image_processing import RandomWidth, ResizePadHW
 from wraper import encode_batch
 
-from model import SwiGLiT 
+from model_conv import SwinGConvTex
+from model_transformer import SwinTransformerTex
 from model_mamba_1layer import SwinMambaTex
+
+# Попытка импорта SymPy для AST-метрик
+try:
+    from sympy.parsing.latex import parse_latex
+    SYMPY_AVAILABLE = True
+except ImportError:
+    SYMPY_AVAILABLE = False
+    print("Внимание: SymPy или antlr4 не установлены. AST-метрика будет использовать fallback.")
 
 sys.modules["data"] = wraper
 
@@ -37,6 +46,11 @@ vocab_obj = None
 vocab = None
 VOCAB_SIZE = 0
 model = None
+
+STRUCTURAL_TOKENS = {
+    '^', '_', '{', '}', '\\frac', '\\sqrt', '\\sum', '\\int', 
+    '\\left', '\\right', '(', ')', '[', ']', '\\begin', '\\end'
+}
 
 
 class CustomVocab:
@@ -80,9 +94,7 @@ image_transform = transforms.Compose([
 
 def load_custom_model(arch_name, vocab_file, weights_file):
     global model, vocab, vocab_obj, VOCAB_SIZE
-    
-    if not vocab_file:
-        return "Ошибка: Пожалуйста, загрузите файл vocab.json."
+    if not vocab_file: return "Ошибка: Пожалуйста, загрузите файл vocab.json."
     
     try:
         with open(vocab_file.name, "r", encoding="utf-8") as f:
@@ -95,25 +107,25 @@ def load_custom_model(arch_name, vocab_file, weights_file):
 
     if not weights_file:
         return f"Словарь загружен (Размер: {VOCAB_SIZE}). Загрузите файл .safetensors для инициализации модели."
-        
     if not arch_name:
         return "Ошибка: Выберите архитектуру модели."
 
     try:
         if arch_name == "SwinMambaTex":
-            if DEVICE == torch.device("cuda"):
+            if DEVICE.type == "cuda":
                 new_model = SwinMambaTex(vocab_size=VOCAB_SIZE, d_model=512).to(torch.bfloat16).cuda()
             else:
                 return "Ошибка: Mamba доступна только на CUDA."
-        elif arch_name == "SwiGLiT":
-            new_model = SwiGLiT(vocab_size=VOCAB_SIZE, d_model=512).to(DEVICE)
+        elif arch_name == "SwinGConvTex":
+            new_model = SwinGConvTex(vocab_size=VOCAB_SIZE, d_model=512).to(DEVICE, torch.bfloat16)
+        elif arch_name == "SwinTransformerTex":
+            new_model = SwinTransformerTex(vocab_size=VOCAB_SIZE, d_model=512).to(DEVICE, torch.bfloat16)
         else:
             return f"Ошибка: Неизвестная архитектура '{arch_name}'."
 
         state_dict = load_file(weights_file.name)
         new_model.load_state_dict(state_dict)
         new_model.eval()
-        
         model = new_model
         return f"Модель {arch_name} успешно загружена!\nРазмер словаря: {VOCAB_SIZE}\nУстройство: {DEVICE}"
     except Exception as e:
@@ -124,37 +136,67 @@ def process_image(img):
         return "Ошибка: Сначала загрузите модель и словарь.", ""
     return predict_latex(img, model, DEVICE, vocab)
 
-def normalize_latex(s):
-    s = s.replace(" ", "")
-    s = s.replace("_{o}", "_{0}")
-    s = re.sub(r'_([a-zA-Z0-9])(?![a-zA-Z0-9])', r'_{\1}', s)
-    s = re.sub(r'\^([a-zA-Z0-9])(?![a-zA-Z0-9])', r'^{\1}', s)
-    return s
 
-BUCKET_KEYS = [
-    "<10", "10-19", "20-29", "30-39", "40-49", 
-    "50-59", "60-69", "70-79", "80-89", "90-100", ">100"
-]
+# --- Новые метрики: Decomp, Structural, AST ---
+
+def get_edit_operations(ref_tokens, hyp_tokens):
+    """Декомпозиция Edit Distance на Ins, Del, Sub"""
+    n, m = len(ref_tokens), len(hyp_tokens)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1): dp[i][0] = i
+    for j in range(m + 1): dp[0][j] = j
+    
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if ref_tokens[i-1] == hyp_tokens[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                dp[i][j] = min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]) + 1
+                
+    ins, dl, sub = 0, 0, 0
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and ref_tokens[i-1] == hyp_tokens[j-1]:
+            i, j = i-1, j-1
+        else:
+            if i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
+                sub += 1; i, j = i-1, j-1
+            elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
+                dl += 1; i -= 1
+            else:
+                ins += 1; j -= 1
+    return ins, dl, sub
+
+def calc_structural_score(ref_tokens, hyp_tokens):
+    ref_struct = [t for t in ref_tokens if t in STRUCTURAL_TOKENS]
+    hyp_struct = [t for t in hyp_tokens if t in STRUCTURAL_TOKENS]
+    if not ref_struct and not hyp_struct: return 1.0
+    if not ref_struct: return 0.0
+    ed = nltk.edit_distance(ref_struct, hyp_struct)
+    return max(0.0, 1.0 - (ed / len(ref_struct)))
+
+def ast_match_score(gt, pred, gt_tokens, pred_tokens):
+    if not SYMPY_AVAILABLE:
+        return calc_structural_score(gt_tokens, pred_tokens)
+    try:
+        ast_ref = parse_latex(gt)
+        ast_hyp = parse_latex(pred)
+        return 1.0 if str(ast_ref) == str(ast_hyp) else 0.0
+    except Exception:
+        # Fallback при ошибке парсинга
+        return calc_structural_score(gt_tokens, pred_tokens)
+
+# ОБНОВЛЕННЫЕ БАКЕТЫ
+BUCKET_KEYS = ["<10", "10-19", "20-29", "30-39", "40-49", "50-59", ">60"]
 
 def _bucket_name(length):
     if length < 10: return "<10"
-    if length > 100: return ">100"
-    if length == 100: return "90-100"
+    if length >= 60: return ">60"
     lower = (length // 10) * 10
-    upper = lower + 9
-    if upper == 99: upper += 1
-    return f"{lower}-{upper}"
+    return f"{lower}-{lower+9}"
 
 def tokenize_latex(s):
-    s = str(s).replace(" ", "")
-    return re.findall(r'\\[a-zA-Z]+|.', s)
-
-def calc_bleu(gt, pred):
-    smoother = SmoothingFunction().method1
-    gt_tokens = tokenize_latex(gt)
-    pred_tokens = tokenize_latex(pred)
-    if not gt_tokens: return 0.0
-    return sentence_bleu([gt_tokens], pred_tokens, smoothing_function=smoother)
+    return re.findall(r'\\[a-zA-Z]+|.', str(s).replace(" ", ""))
 
 def _prepare_gradio_data(log_data):
     metrics = log_data["metrics"]
@@ -162,139 +204,181 @@ def _prepare_gradio_data(log_data):
         "Примеров": metrics.get("samples", 0),
         "Точность токенов": f"{metrics.get('token_accuracy', 0.0):.4f}",
         "Exact Match": f"{metrics.get('exact_match', 0.0):.4f}",
+        "AST/Struct Score": f"{metrics.get('avg_ast_score', 0.0):.4f}",
         "BLEU Score": f"{metrics.get('bleu', 0.0):.4f}",
-        "CER (Симв. ошибка)": f"{metrics.get('avg_cer', 0.0):.4f}", 
-        "Скорость (штук/сек)": f"{metrics.get('inference_samples_per_sec', 0.0):.2f}",
-        "Ср. Edit Dist": f"{metrics.get('avg_edit_distance', 0.0):.4f}",
-        "Норм. Edit Dist": f"{metrics.get('normalized_edit_distance', 0.0):.4f}",
-        "Ошибка длины (Абс)": f"{metrics.get('avg_length_abs_error', 0.0):.4f}"
+        "Token CER": f"{metrics.get('avg_cer', 0.0):.4f}",
+        "Token ED (Ср.)": f"{metrics.get('avg_token_ed', 0.0):.2f}",
+        "Tok/Sec": f"{metrics.get('throughput_tokens_per_sec', 0.0):.2f}",
+        "Latency/Token (ms)": f"{metrics.get('latency_per_token_ms', 0.0):.2f}"
     }])
     
+    # Использование ключей из логов (совместимость со старыми логами)
     buckets = list(log_data["bucket_stats"].keys())
+    stats = log_data["bucket_stats"]
+    
     bucket_df = pd.DataFrame({
-        "Длинна": buckets,
-        "Количество изображений": [log_data["bucket_stats"][k].get("sample_count", 0) for k in buckets],
-        "Полное совпадение": [log_data["bucket_stats"][k].get("exact_match", 0.0) for k in buckets],
-        "BLEU": [log_data["bucket_stats"][k].get("avg_bleu", 0.0) for k in buckets],
-        "Средняя дистанция ошибки": [log_data["bucket_stats"][k].get("avg_edit_distance", 0.0) for k in buckets]
+        "Длина": buckets,
+        "Samples": [stats[k].get("sample_count", 0) for k in buckets],
+        "Exact Match": [stats[k].get("exact_match", 0.0) for k in buckets],
+        "BLEU": [stats[k].get("avg_bleu", 0.0) for k in buckets],
+        "Structural Score": [stats[k].get("avg_struct_score", 0.0) for k in buckets],
+        "Ins": [stats[k].get("avg_ins", 0.0) for k in buckets],
+        "Del": [stats[k].get("avg_del", 0.0) for k in buckets],
+        "Sub": [stats[k].get("avg_sub", 0.0) for k in buckets],
+        "Throughput": [stats[k].get("tokens_per_sec", 0.0) for k in buckets],
+        "Token CER": [stats[k].get("avg_token_cer", 0.0) for k in buckets],
+        "Token ED": [stats[k].get("avg_token_ed", 0.0) for k in buckets]
     })
     
-    # Генерация графиков Plotly (с цифрами на корзинах)
-    fig_samples = px.bar(bucket_df, x="Длинна", y="Количество изображений", text_auto=True, title="Количество примеров по бакетам (длине)")
-    fig_em = px.bar(bucket_df, x="Длинна", y="Полное совпадение", text_auto='.3f', title="Точное совпадение (Exact Match) по бакетам")
-    fig_bleu = px.bar(bucket_df, x="Длинна", y="BLEU", text_auto='.3f', title="BLEU Score по бакетам")
-    fig_ed = px.bar(bucket_df, x="Длинна", y="Средняя дистанция ошибки", text_auto='.3f', title="Ср. расстояние редактирования по бакетам")
+    # Графики
+    fig_samples = px.bar(bucket_df, x="Длина", y="Samples", text_auto=True, title="Распределение длин")
+    fig_em = px.bar(bucket_df, x="Длина", y="Exact Match", text_auto='.3f', title="Exact Match vs Длина")
     
-    return summary_df, fig_samples, fig_em, fig_bleu, fig_ed
+    fig_errs = px.bar(bucket_df, x="Длина", y=["Ins", "Del", "Sub"], title="Декомпозиция ошибок (Ins/Del/Sub) vs Длина", barmode='stack')
+    fig_struct = px.line(bucket_df, x="Длина", y="Structural Score", markers=True, title="Structural/AST Score vs Длина")
+    
+    # НОВЫЕ ГРАФИКИ
+    fig_cer = px.line(bucket_df, x="Длина", y="Token CER", markers=True, title="Token CER vs Длина (Меньше - лучше)")
+    fig_token_ed = px.line(bucket_df, x="Длина", y="Token ED", markers=True, title="Token Edit Distance vs Длина")
+    fig_bleu = px.line(bucket_df, x="Длина", y="BLEU", markers=True, title="BLEU Score vs Длина")
+    fig_thr = px.line(bucket_df, x="Длина", y="Throughput", markers=True, title="Пропускная способность (Токены/сек)")
+    
+    return summary_df, fig_samples, fig_em, fig_errs, fig_struct, fig_cer, fig_token_ed, fig_bleu, fig_thr
 
 
 def run_test_dataset(max_samples, batch_size, progress=gr.Progress(track_tqdm=True)):
     if model is None or vocab_obj is None:
         raise ValueError("Загрузите модель и словарь перед запуском.")
         
-    max_samples = int(max_samples)
-    batch_size = int(batch_size)
-
+    max_samples, batch_size = int(max_samples), int(batch_size)
     split_name = "test" if max_samples <= 0 else f"test[:{max_samples}]"
     ds = load_dataset("deepcopy/MathWriting-Human", split=split_name)
 
     all_pred_texts, all_gt_texts, items = [], [], []
     bucket_raw = {k: [] for k in BUCKET_KEYS}
+    
     total_inference_time = 0.0 
+    total_generated_tokens = 0
 
-    for i in progress.tqdm(range(0, len(ds), batch_size), desc="Идет тестирование"):
+    for i in progress.tqdm(range(0, len(ds), batch_size), desc="Тестирование"):
         batch = ds[i : i + batch_size]
         images = [image_transform(img) for img in batch["image"]]
         
-        if DEVICE == torch.device("cuda"):
-            image_tensor = torch.stack(images).to(torch.bfloat16).cuda()
-        else:
-            image_tensor = torch.stack(images).to(DEVICE)
+        image_tensor = torch.stack(images).to(DEVICE, torch.bfloat16)
 
         t0 = time.time()
         with torch.no_grad():
             predictions = model.generate_beam_search(
                 images=image_tensor, start_token_id=1, eos_token_id=2, beam_size=5, max_new_tokens=256)
-        total_inference_time += (time.time() - t0)
+        batch_time = time.time() - t0
+        total_inference_time += batch_time
 
         gt_texts = batch["latex"]
         for local_idx in range(predictions.shape[0]):
-            candidates = [decode_tokens(vocab, predictions[local_idx][k]) for k in range(len(predictions[local_idx]))]
-            pred_text = candidates[0]
+            pred_seq = predictions[local_idx][0].tolist()
+            if 2 in pred_seq:
+                num_tokens = pred_seq.index(2) + 1
+            else:
+                num_tokens = len(pred_seq)
+            total_generated_tokens += num_tokens
             
+            sample_time = batch_time / len(gt_texts) 
+
+            pred_text = decode_tokens(vocab, predictions[local_idx][0])
             gt = gt_texts[local_idx]
-            gt_len = len(''.join(gt.split()))
-            pred_len = len(''.join(pred_text.split()))
+            
+            gt_t = tokenize_latex(gt)
+            pred_t = tokenize_latex(pred_text)
+            gt_len = len(gt_t)
             
             p_tensor = encode_batch([pred_text], vocab_obj)
             t_tensor = encode_batch([gt], vocab_obj)
             
             ed = avg_edit_distance(p_tensor, t_tensor)
             em = exact_match(p_tensor, t_tensor)
-            bleu_val = calc_bleu(gt, pred_text)
             
-            gt_chars, pred_chars = gt.replace(" ", ""), pred_text.replace(" ", "")
-            char_ed = nltk.edit_distance(gt_chars, pred_chars)
-            cer_val = char_ed / max(len(gt_chars), 1)
+            # ИСПРАВЛЕННЫЙ BLEU SCORE
+            if gt_len > 0:
+                smooth_fn = SmoothingFunction().method4
+                # Используем меньшие n-граммы для коротких формул, чтобы избежать BLEU = 0.0
+                if gt_len == 1: w = (1.0, 0, 0, 0)
+                elif gt_len == 2: w = (0.5, 0.5, 0, 0)
+                elif gt_len == 3: w = (0.33, 0.33, 0.33, 0)
+                else: w = (0.25, 0.25, 0.25, 0.25)
+                bleu_val = sentence_bleu([gt_t], pred_t, weights=w, smoothing_function=smooth_fn)
+            else:
+                bleu_val = 0.0
+            
+            ins, dl, sub = get_edit_operations(gt_t, pred_t)
+            token_ed = ins + dl + sub
+            token_cer = token_ed / max(1, gt_len) # Token CER (TER)
+            
+            struct_score = calc_structural_score(gt_t, pred_t)
+            ast_score = ast_match_score(gt, pred_text, gt_t, pred_t)
 
             bucket = _bucket_name(gt_len)
-            bucket_raw[bucket].append({"exact_match": em, "edit_distance": ed, "bleu": bleu_val})
+            bucket_raw[bucket].append({
+                "exact_match": em, "edit_distance": ed, "bleu": bleu_val,
+                "ins": ins, "del": dl, "sub": sub, "struct_score": ast_score,
+                "tokens": num_tokens, "time": sample_time,
+                "token_ed": token_ed, "token_cer": token_cer
+            })
 
             items.append({
-                "index": i + local_idx,
-                "ground_truth": gt,
-                "prediction": pred_text,
-                "gt_length": gt_len,
-                "pred_length": pred_len,
-                "exact_match": float(em),
-                "edit_distance": float(ed),
-                "bleu": float(bleu_val),
-                "cer": float(cer_val)
+                "index": i + local_idx, "ground_truth": gt, "prediction": pred_text,
+                "gt_length": gt_len, "pred_length": len(pred_t), "exact_match": float(em),
+                "ins": ins, "del": dl, "sub": sub, "ast_struct_score": float(ast_score),
+                "latency_sec": sample_time,
+                "bleu": float(bleu_val), "token_ed": int(token_ed), "token_cer": float(token_cer)
             })
             all_pred_texts.append(pred_text)
             all_gt_texts.append(gt)
 
+    # Глобальные метрики
     pred_tensor = encode_batch(all_pred_texts, vocab_obj)
     tgt_tensor = encode_batch(all_gt_texts, vocab_obj)
-
     token_acc = token_accuracy(pred_tensor, tgt_tensor)
-    em_score, avg_bleu, avg_cer, norm_ed, len_abs_err = 0, 0.0, 0.0, 0.0, 0.0
-    edit_score = avg_edit_distance(pred_tensor, tgt_tensor)
-
-    for item in items:
-        norm_ed += item["edit_distance"] / max(item["gt_length"], 1)
-        len_abs_err += abs(item["pred_length"] - item["gt_length"])
-        avg_bleu += item["bleu"]
-        avg_cer += item["cer"]
-
-    total = max(len(items), 1)
-    norm_ed /= total
-    len_abs_err /= total
-    avg_bleu /= total
-    avg_cer /= total
-    samples_per_sec = total / total_inference_time if total_inference_time > 0 else 0.0
+    
+    throughput_tps = total_generated_tokens / total_inference_time if total_inference_time > 0 else 0
+    latency_per_token_ms = (total_inference_time / total_generated_tokens * 1000) if total_generated_tokens > 0 else 0
 
     bucket_stats = {}
+    avg_ast = 0.0
     for bucket in BUCKET_KEYS:
-        values = bucket_raw[bucket]
-        if not values:
-            bucket_stats[bucket] = {"sample_count": 0, "exact_match": 0.0, "avg_edit_distance": 0.0, "avg_bleu": 0.0}
+        vals = bucket_raw[bucket]
+        if not vals:
+            bucket_stats[bucket] = {"sample_count": 0}
         else:
-            bucket_stats[bucket] = {
-                "sample_count": len(values),
-                "exact_match": sum(v["exact_match"] for v in values) / len(values),
-                "avg_edit_distance": sum(v["edit_distance"] for v in values) / len(values),
-                "avg_bleu": sum(v["bleu"] for v in values) / len(values)
-            }
-            em_score += sum(v["exact_match"] for v in values)
+            bc_len = len(vals)
+            t_toks = sum(v["tokens"] for v in vals)
+            t_time = sum(v["time"] for v in vals)
             
-    em_score /= total
+            bucket_stats[bucket] = {
+                "sample_count": bc_len,
+                "exact_match": sum(v["exact_match"] for v in vals) / bc_len,
+                "avg_bleu": sum(v["bleu"] for v in vals) / bc_len,
+                "avg_ins": sum(v["ins"] for v in vals) / bc_len,
+                "avg_del": sum(v["del"] for v in vals) / bc_len,
+                "avg_sub": sum(v["sub"] for v in vals) / bc_len,
+                "avg_struct_score": sum(v["struct_score"] for v in vals) / bc_len,
+                "avg_token_ed": sum(v["token_ed"] for v in vals) / bc_len,
+                "avg_token_cer": sum(v["token_cer"] for v in vals) / bc_len,
+                "tokens_per_sec": t_toks / t_time if t_time > 0 else 0
+            }
+            avg_ast += sum(v["struct_score"] for v in vals)
+            
+    avg_ast /= max(len(items), 1)
+
     log_data = {
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "metrics": {
-            "samples": len(items), "token_accuracy": float(token_acc), "exact_match": float(em_score),
-            "bleu": float(avg_bleu), "avg_cer": float(avg_cer), "inference_samples_per_sec": float(samples_per_sec),
-            "avg_edit_distance": float(edit_score), "normalized_edit_distance": float(norm_ed), "avg_length_abs_error": float(len_abs_err),
+            "samples": len(items), "token_accuracy": float(token_acc),
+            "exact_match": sum(i["exact_match"] for i in items) / max(len(items), 1),
+            "avg_ast_score": float(avg_ast),
+            "bleu": sum(i["bleu"] for i in items) / max(len(items), 1),
+            "avg_cer": sum(i["token_cer"] for i in items) / max(len(items), 1),
+            "avg_token_ed": sum(i["token_ed"] for i in items) / max(len(items), 1),
+            "throughput_tokens_per_sec": throughput_tps, "latency_per_token_ms": latency_per_token_ms
         },
         "bucket_stats": bucket_stats,
         "items": items,
@@ -305,43 +389,22 @@ def run_test_dataset(max_samples, batch_size, progress=gr.Progress(track_tqdm=Tr
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(log_data, f, ensure_ascii=False, indent=2)
 
-    summary_df, f_samples, f_em, f_bleu, f_ed = _prepare_gradio_data(log_data)
-    return summary_df, f_samples, f_em, f_bleu, f_ed, out_path
-
+    return _prepare_gradio_data(log_data) + (out_path,)
 
 def load_test_logs(file_obj):
-    if file_obj is None:
-        return pd.DataFrame(), go.Figure(), go.Figure(), go.Figure(), go.Figure()
-
+    if file_obj is None: 
+        empty = go.Figure()
+        return pd.DataFrame(), empty, empty, empty, empty, empty, empty, empty, empty
     with open(file_obj.name, "r", encoding="utf-8") as f:
         log_data = json.load(f)
+    return _prepare_gradio_data(log_data)
 
-    summary_df, f_samples, f_em, f_bleu, f_ed = _prepare_gradio_data(log_data)
-    return summary_df, f_samples, f_em, f_bleu, f_ed
-
-
-def load_raw_data_chunk(file_obj, start_idx, chunk_size):
-    if file_obj is None: return pd.DataFrame(), "Файл не загружен."
-    try:
-        with open(file_obj.name, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        items = data.get("items", [])
-        total = len(items)
-        end_idx = min(start_idx + chunk_size, total)
-        df = pd.DataFrame(items[start_idx:end_idx])
-        return df, f"Показаны строки с {start_idx} по {end_idx - 1} из {total}."
-    except Exception as e:
-        return pd.DataFrame(), f"Ошибка чтения логов: {str(e)}"
-
-
-# --- TRAINING GRAPHS LOGIC ---
 def load_training_graphs(epoch_file, step_file):
     fig_loss = go.Figure(layout=go.Layout(title="Потери (Loss)"))
     fig_ed = go.Figure(layout=go.Layout(title="Расстояние редактирования (Edit Distance)"))
     fig_acc = go.Figure(layout=go.Layout(title="Точность (Sequence Accuracy)"))
     fig_lr = go.Figure(layout=go.Layout(title="Скорость обучения (LR)"))
     fig_step = go.Figure(layout=go.Layout(title="Потери по шагам (Step Loss)"))
-
     if epoch_file is not None:
         try:
             df_e = pd.read_csv(epoch_file.name)
@@ -366,12 +429,11 @@ def load_training_graphs(epoch_file, step_file):
 
     return fig_loss, fig_ed, fig_acc, fig_lr, fig_step
 
-
 def compare_inference_models(files):
     if not files:
         empty_fig = go.Figure()
-        return empty_fig, empty_fig, empty_fig, empty_fig, empty_fig, empty_fig
-        
+        return empty_fig, empty_fig, empty_fig, empty_fig, empty_fig, empty_fig, empty_fig, empty_fig, empty_fig
+    
     global_records = []
     bucket_records = []
 
@@ -388,10 +450,11 @@ def compare_inference_models(files):
                 "Exact Match": metrics.get("exact_match", 0),
                 "BLEU Score": metrics.get("bleu", 0),
                 "Точность токенов": metrics.get("token_accuracy", 0),
-                "CER": metrics.get("avg_cer", 0),
-                "Нормализованная дистанция ошибки": metrics.get("normalized_edit_distance", 0),
-                "Средняя дистанция ошибки": metrics.get("avg_edit_distance", 0),
-                "Скорость (штук/сек)": metrics.get("inference_samples_per_sec", 0)
+                "AST/Struct Score": metrics.get("avg_ast_score", 0),
+                "Token CER": metrics.get("avg_cer", 0),
+                "Token ED": metrics.get("avg_token_ed", 0),
+                "Скорость (Токены/сек)": metrics.get("throughput_tokens_per_sec", metrics.get("inference_samples_per_sec", 0)),
+                "Задержка (мс/токен)": metrics.get("latency_per_token_ms", 0)
             })
 
             bucket_stats = data.get("bucket_stats", {})
@@ -401,7 +464,10 @@ def compare_inference_models(files):
                     "Длина": bucket,
                     "Exact Match": stats.get("exact_match", 0),
                     "BLEU Score": stats.get("avg_bleu", 0),
-                    "Edit Distance": stats.get("avg_edit_distance", 0)
+                    "Structural Score": stats.get("avg_struct_score", 0),
+                    "Token CER": stats.get("avg_token_cer", 0),
+                    "Token ED": stats.get("avg_token_ed", 0),
+                    "Скорость (Токены/сек)": stats.get("tokens_per_sec", 0)
                 })
         except Exception as e:
             print(f"Ошибка обработки {f.name}: {e}")
@@ -413,112 +479,97 @@ def compare_inference_models(files):
         df_bucket['Длина'] = pd.Categorical(df_bucket['Длина'], categories=BUCKET_KEYS, ordered=True)
         df_bucket = df_bucket.sort_values('Длина')
 
-    df_em_bleu = df_global.melt(id_vars=["Модель"], value_vars=["Exact Match", "BLEU Score"], var_name="Метрика", value_name="Значение")
-    fig_global_1 = px.bar(df_em_bleu, x="Модель", y="Значение", color="Метрика", barmode="group", text_auto='.3f', title="Глобальные метрики: Точность")
+    df_global_acc = df_global.melt(id_vars=["Модель"], value_vars=["Exact Match", "BLEU Score", "Точность токенов", "AST/Struct Score"], var_name="Метрика", value_name="Значение")
+    fig_global_acc = px.bar(df_global_acc, x="Модель", y="Значение", color="Метрика", barmode="group", text_auto='.3f', title="Глобальные метрики: Точность (Больше - лучше)")
 
-    df_err = df_global.melt(id_vars=["Модель"], value_vars=["CER", "Нормализованная дистанция ошибки", "Средняя дистанция ошибки"], var_name="Метрика", value_name="Значение")
-    fig_global_2 = px.bar(df_err, x="Модель", y="Значение", color="Метрика", barmode="group", text_auto='.3f', title="Глобальные метрики: Ошибки (меньше - лучше)")
+    df_global_err = df_global.melt(id_vars=["Модель"], value_vars=["Token CER", "Token ED"], var_name="Метрика", value_name="Значение")
+    fig_global_err = px.bar(df_global_err, x="Модель", y="Значение", color="Метрика", barmode="group", text_auto='.3f', title="Глобальные метрики: Ошибки (Меньше - лучше)")
 
-    fig_speed = px.bar(df_global, x="Модель", y="Скорость (штук/сек)", color="Модель", text_auto='.2f', title="Скорость генерации (FPS)")
+    df_global_perf = df_global.melt(id_vars=["Модель"], value_vars=["Скорость (Токены/сек)", "Задержка (мс/токен)"], var_name="Метрика", value_name="Значение")
+    fig_global_perf = px.bar(df_global_perf, x="Модель", y="Значение", color="Метрика", barmode="group", text_auto='.2f', title="Глобальные метрики: Производительность")
 
-    fig_bucket_em = px.line(df_bucket, x="Длина", y="Exact Match", color="Модель", markers=True, title="Сравнение Exact Match по длине формул")
+    fig_bucket_em = px.line(df_bucket, x="Длина", y="Exact Match", color="Модель", markers=True, title="Сравнение Exact Match по длине")
+    fig_bucket_bleu = px.line(df_bucket, x="Длина", y="BLEU Score", color="Модель", markers=True, title="Сравнение BLEU Score по длине")
+    fig_bucket_struct = px.line(df_bucket, x="Длина", y="Structural Score", color="Модель", markers=True, title="Сравнение Structural/AST Score по длине")
+    fig_bucket_cer = px.line(df_bucket, x="Длина", y="Token CER", color="Модель", markers=True, title="Сравнение Token CER по длине (Меньше - лучше)")
+    fig_bucket_ed = px.line(df_bucket, x="Длина", y="Token ED", color="Модель", markers=True, title="Сравнение Token Edit Distance по длине")
+    fig_bucket_thr = px.line(df_bucket, x="Длина", y="Скорость (Токены/сек)", color="Модель", markers=True, title="Пропускная способность (Токены/сек) по длине")
 
-    fig_bucket_bleu = px.line(df_bucket, x="Длина", y="BLEU Score", color="Модель", markers=True, title="Сравнение BLEU Score по длине формул")
-
-    fig_bucket_ed = px.line(df_bucket, x="Длина", y="Edit Distance", color="Модель", markers=True, title="Сравнение Edit Distance по длине формул (меньше - лучше)")
-
-    return fig_global_1, fig_global_2, fig_speed, fig_bucket_em, fig_bucket_bleu, fig_bucket_ed
+    return fig_global_acc, fig_global_err, fig_global_perf, fig_bucket_em, fig_bucket_bleu, fig_bucket_struct, fig_bucket_cer, fig_bucket_ed, fig_bucket_thr
 
 
-with gr.Blocks(theme=gr.themes.Default(primary_hue="blue", secondary_hue="indigo")) as demo:
-    gr.Markdown("Приложение для перевода математики в LaTeX")
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# Переводчик Математики в LaTeX")
 
     with gr.Tabs():
         with gr.TabItem("Конвертер"):
-            gr.Markdown("Загрузите изображение математического выражения и получите соответствующий код LaTeX.")
-            
             with gr.Accordion("Настройки и загрузка модели", open=True):
                 with gr.Row():
-                    arch_dropdown = gr.Dropdown(choices=["SwinMambaTex", "SwiGLiT"], label="Архитектура модели", value="SwinMambaTex")
-                    upload_vocab = gr.File(label="Загрузить словарь (vocab.json)", file_types=[".json"])
-                    upload_weights = gr.File(label="Загрузить веса (.safetensors)", file_types=[".safetensors"])
+                    arch_dropdown = gr.Dropdown(choices=["SwinMambaTex", "SwinTransformerTex", "SwinGConvTex"], label="Архитектура", value="SwinMambaTex")
+                    upload_vocab = gr.File(label="vocab.json", file_types=[".json"])
+                    upload_weights = gr.File(label="Веса (.safetensors)", file_types=[".safetensors"])
                 with gr.Row():
-                    load_model_btn = gr.Button("Загрузить выбранную модель", variant="primary")
-                    model_status = gr.Textbox(label="Статус модели", value="Модель не загружена.", interactive=False)
-                    
+                    load_model_btn = gr.Button("Загрузить модель", variant="primary")
+                    model_status = gr.Textbox(label="Статус", interactive=False)
                 load_model_btn.click(fn=load_custom_model, inputs=[arch_dropdown, upload_vocab, upload_weights], outputs=[model_status])
 
             with gr.Row():
                 with gr.Column():
-                    input_img = gr.Image(type="pil", label="Загрузить изображение")
-                    submit_btn = gr.Button("Преобразовать в LaTeX", variant="primary")
+                    input_img = gr.Image(type="pil", label="Изображение формулы")
+                    submit_btn = gr.Button("Конвертировать", variant="primary")
                 with gr.Column():
-                    output_code = gr.Textbox(label="Полученный LaTeX код", lines=4)
-                    output_render = gr.Markdown(label="Отформатированный вывод")
-
+                    output_code = gr.Textbox(label="LaTeX Код", lines=4)
+                    output_render = gr.Markdown(label="Рендер")
             submit_btn.click(fn=process_image, inputs=[input_img], outputs=[output_code, output_render])
 
         with gr.TabItem("Статистика датасета"):
-            gr.Markdown("Запуск инференса на тестовом наборе данных с подсчетом метрик и построением графиков.")
+            gr.Markdown("Запуск тестирования с подсчетом структурных метрик (AST/SymPy), декомпозиции ошибок и производительности.")
             with gr.Row():
-                max_samples = gr.Number(value=50, precision=0, label="Макс. примеров (0 = весь test split)")
-                batch_size = gr.Number(value=8, precision=0, label="Размер батча (Batch size)")
-            run_btn = gr.Button("Запустить тестирование", variant="primary")
+                max_samples = gr.Number(value=50, precision=0, label="Макс. примеров (0 = все)")
+                batch_size = gr.Number(value=8, precision=0, label="Размер батча")
+            run_btn = gr.Button("Запустить", variant="primary")
 
-            summary_table = gr.Dataframe(label="Глобальные результаты тестирования", interactive=False)
+            summary_table = gr.Dataframe(label="Глобальные метрики", interactive=False)
             
             with gr.Row():
-                plot_samples = gr.Plot(label="Количество примеров")
+                plot_samples = gr.Plot(label="Распределение")
                 plot_em = gr.Plot(label="Exact Match")
             with gr.Row():
+                plot_errs = gr.Plot(label="Error Decomp (Ins/Del/Sub)")
+                plot_struct = gr.Plot(label="Structural/AST Score")
+            with gr.Row():
+                plot_cer = gr.Plot(label="Token CER (TER)")
+                plot_token_ed = gr.Plot(label="Token Edit Distance")
+            with gr.Row():
                 plot_bleu = gr.Plot(label="BLEU Score")
-                plot_ed = gr.Plot(label="Edit Distance")
+                plot_thr = gr.Plot(label="Throughput (Tokens/s)")
             
-            download_logs = gr.File(label="Скачать сырые JSON логи")
+            download_logs = gr.File(label="Скачать JSON логи")
 
             run_btn.click(
                 fn=run_test_dataset,
                 inputs=[max_samples, batch_size],
-                outputs=[summary_table, plot_samples, plot_em, plot_bleu, plot_ed, download_logs],
+                outputs=[summary_table, plot_samples, plot_em, plot_errs, plot_struct, plot_cer, plot_token_ed, plot_bleu, plot_thr, download_logs],
             )
 
-            gr.Markdown("### Или загрузите уже существующий лог JSON")
-            upload_logs = gr.File(file_types=[".json"], label="Загрузить JSON лог")
-            load_btn = gr.Button("Загрузить логи")
-            
+            gr.Markdown("### Загрузить существующий лог")
+            upload_logs = gr.File(file_types=[".json"], label="Загрузить JSON")
+            load_btn = gr.Button("Показать графики")
             load_btn.click(
                 fn=load_test_logs,
                 inputs=[upload_logs],
-                outputs=[summary_table, plot_samples, plot_em, plot_bleu, plot_ed],
+                outputs=[summary_table, plot_samples, plot_em, plot_errs, plot_struct, plot_cer, plot_token_ed, plot_bleu, plot_thr],
             )
-
-        with gr.TabItem("Сырые данные тренировки"):
-            gr.Markdown("Здесь можно детально просмотреть данные для каждого изображения. **Данные загружаются частями (chunks), чтобы не перегружать RAM.**")
-            raw_json_input = gr.File(label="Загрузите JSON файл, сгенерированный во вкладке Статистики", file_types=[".json"])
-            
-            with gr.Row():
-                start_idx = gr.Number(value=0, precision=0, label="Начальный индекс")
-                chunk_size = gr.Number(value=50, precision=0, label="Количество строк (Chunk size)")
-            
-            load_chunk_btn = gr.Button("Показать строки", variant="primary")
-            chunk_status = gr.Markdown("Файл не загружен")
-            raw_dataframe = gr.Dataframe(label="Детальная таблица по картинкам", interactive=False, wrap=True)
-            
-            load_chunk_btn.click(
-                fn=load_raw_data_chunk,
-                inputs=[raw_json_input, start_idx, chunk_size],
-                outputs=[raw_dataframe, chunk_status]
-            )
-
+        
         with gr.TabItem("Графики обучения"):
             gr.Markdown("Загрузите CSV файлы логов (формат: `epoch, train_loss, val_loss, edit_distance, norm_edit_distance, sequence_accuracy, lr`)")
-            
+
             with gr.Row():
                 upload_epoch_csv = gr.File(label="Логи по Эпохам (Epoch Logs)", file_types=[".csv"])
                 upload_step_csv = gr.File(label="Логи по Шагам (Step Logs)", file_types=[".csv"])
-            
+
             plot_graphs_btn = gr.Button("Построить графики обучения", variant="primary")
-            
+
             with gr.Row():
                 epoch_loss_plot = gr.Plot(label="Потери (Loss)")
                 epoch_ed_plot = gr.Plot(label="Расстояние редактирования (Edit Distance)")
@@ -527,43 +578,47 @@ with gr.Blocks(theme=gr.themes.Default(primary_hue="blue", secondary_hue="indigo
                 epoch_lr_plot = gr.Plot(label="Скорость обучения (LR)")
             with gr.Row():
                 step_loss_plot = gr.Plot(label="Потери по шагам")
-                
+
             plot_graphs_btn.click(
                 fn=load_training_graphs,
                 inputs=[upload_epoch_csv, upload_step_csv],
                 outputs=[epoch_loss_plot, epoch_ed_plot, epoch_acc_plot, epoch_lr_plot, step_loss_plot]
             )
-            
+        
 
         with gr.TabItem("Сравнение моделей (Инференс)"):
-            gr.Markdown("Загрузите несколько **JSON файлов**, полученных во вкладке `Статистика датасета`, чтобы визуально сравнить результаты нескольких моделей.")
-            
+            gr.Markdown("Загрузите несколько **JSON файлов**, полученных во вкладке `Статистика датасета`, чтобы визуально сравнить результаты нескольких моделей по всем новым метрикам.")
+
             upload_multi_json = gr.File(label="Выберите несколько JSON файлов (Логи статистики)", file_types=[".json"], file_count="multiple")
             compare_btn = gr.Button("Построить графики сравнения моделей", variant="primary")
-            
-            gr.Markdown("### 📊 Глобальные метрики")
+
+            gr.Markdown("### Глобальные метрики")
             with gr.Row():
-                comp_global_1 = gr.Plot()
-                comp_global_2 = gr.Plot()
+                comp_global_acc = gr.Plot(label="Точность")
+                comp_global_err = gr.Plot(label="Ошибки")
             with gr.Row():
-                comp_speed = gr.Plot()
-                
-            gr.Markdown("### 📈 Детальные метрики по бакетам (по длине формул)")
+                comp_global_perf = gr.Plot(label="Производительность")
+
+            gr.Markdown("### Детальные метрики по бакетам (по длине формул)")
             with gr.Row():
-                comp_bucket_em = gr.Plot()
-                comp_bucket_bleu = gr.Plot()
+                comp_bucket_em = gr.Plot(label="Exact Match")
+                comp_bucket_bleu = gr.Plot(label="BLEU Score")
             with gr.Row():
-                comp_bucket_ed = gr.Plot()
-            
+                comp_bucket_struct = gr.Plot(label="Structural/AST Score")
+                comp_bucket_cer = gr.Plot(label="Token CER")
+            with gr.Row():
+                comp_bucket_ed = gr.Plot(label="Token ED")
+                comp_bucket_thr = gr.Plot(label="Throughput")
+
             compare_btn.click(
                 fn=compare_inference_models,
                 inputs=[upload_multi_json],
                 outputs=[
-                    comp_global_1, comp_global_2, comp_speed, 
-                    comp_bucket_em, comp_bucket_bleu, comp_bucket_ed
+                    comp_global_acc, comp_global_err, comp_global_perf, 
+                    comp_bucket_em, comp_bucket_bleu, comp_bucket_struct,
+                    comp_bucket_cer, comp_bucket_ed, comp_bucket_thr
                 ]
             )
 
 if __name__ == "__main__":
-    print("Запуск интерфейса Gradio...")
     demo.launch(share=False)

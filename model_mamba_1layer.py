@@ -139,7 +139,8 @@ class MambaDecoder(nn.Module):
             x = x + self.pos[:, :seq_len]
         else:
             x = x + self.pos[:, step : step + 1]
-        
+            # x = x + self.pos[:, step] cuda graph optimizations
+        x = x.contiguous() 
         if cross_attn_caches is None:
             cross_attn_caches = [None] * len(self.blocks)
 
@@ -176,6 +177,18 @@ class SwinMambaTex(nn.Module):
         memory = memory + self.pos_encoder(H, W)
 
         inference_params = InferenceParams(max_seqlen=max_new_tokens, max_batch_size=B)
+        
+        dummy_input = torch.empty(1, memory.size(-1), device=device, dtype=memory.dtype)
+        cache_dtype = self.decoder.blocks[0].q_proj(dummy_input).dtype
+        
+        for blk in self.decoder.blocks:
+            layer_idx = blk.ssm1.layer_idx
+            inference_params.key_value_memory_dict[layer_idx] = blk.ssm1.allocate_inference_cache(
+                batch_size=B,
+                max_seqlen=max_new_tokens,
+                dtype=cache_dtype
+            )
+
         cross_attn_caches = [{} for _ in range(len(self.decoder.blocks))]
 
         current_tokens = torch.full((B, 1), start_token_id, dtype=torch.long, device=device)
@@ -191,9 +204,7 @@ class SwinMambaTex(nn.Module):
             )
 
             next_token_logits = logits[:, -1, :] / temperature
-            
             next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-            
             generated_tokens.append(next_token)
             current_tokens = next_token
 
@@ -204,6 +215,7 @@ class SwinMambaTex(nn.Module):
 
         return torch.cat(generated_tokens, dim=1)
     
+
     @torch.no_grad()
     def generate_beam_search(self, images, start_token_id, beam_size=3, max_new_tokens=100, eos_token_id=None):
         self.eval()
@@ -212,10 +224,21 @@ class SwinMambaTex(nn.Module):
 
         memory, (H, W) = self.encoder(images)
         memory = memory + self.pos_encoder(H, W)
-
         memory = memory.repeat_interleave(beam_size, dim=0)
 
         inference_params = InferenceParams(max_seqlen=max_new_tokens, max_batch_size=B * beam_size)
+        
+        dummy_input = torch.empty(1, memory.size(-1), device=device, dtype=memory.dtype)
+        cache_dtype = self.decoder.blocks[0].q_proj(dummy_input).dtype
+        
+        for blk in self.decoder.blocks:
+            layer_idx = blk.ssm1.layer_idx
+            inference_params.key_value_memory_dict[layer_idx] = blk.ssm1.allocate_inference_cache(
+                batch_size=B * beam_size,
+                max_seqlen=max_new_tokens,
+                dtype=cache_dtype
+            )
+
         cross_attn_caches = [{} for _ in range(len(self.decoder.blocks))]
 
         beam_scores = torch.full((B, beam_size), -1e9, dtype=torch.float, device=device)
@@ -223,13 +246,7 @@ class SwinMambaTex(nn.Module):
         
         generated_tokens = torch.full((B * beam_size, 1), start_token_id, dtype=torch.long, device=device)
         current_tokens = generated_tokens.clone()
-        
         is_finished = torch.zeros(B * beam_size, dtype=torch.bool, device=device)
-
-        for cache in cross_attn_caches:
-            if "k" in cache:
-                cache["k"] = cache["k"][global_beam_indices]
-                cache["v"] = cache["v"][global_beam_indices]
 
         for step in range(max_new_tokens):
             logits = self.decoder(
@@ -249,13 +266,10 @@ class SwinMambaTex(nn.Module):
 
             vocab_size = next_token_logprobs.shape[-1]
             next_token_logprobs = next_token_logprobs.view(B, beam_size, vocab_size)
-            
             cumulative_scores = beam_scores.unsqueeze(-1) + next_token_logprobs
-            
             cumulative_scores = cumulative_scores.view(B, beam_size * vocab_size)
 
             top_scores, top_indices = torch.topk(cumulative_scores, beam_size, dim=1)
-
             beam_scores = top_scores
 
             beam_indices = top_indices // vocab_size
@@ -263,8 +277,6 @@ class SwinMambaTex(nn.Module):
 
             batch_offset = torch.arange(B, device=device).unsqueeze(1) * beam_size
             global_beam_indices = (batch_offset + beam_indices).view(-1)
-
-            
 
             for layer_idx, state in inference_params.key_value_memory_dict.items():
                 if isinstance(state, tuple):
@@ -285,5 +297,67 @@ class SwinMambaTex(nn.Module):
                     break
         
             inference_params.seqlen_offset += 1
+            
         best_sequences = generated_tokens.view(B, beam_size, -1)
         return best_sequences
+
+    @torch.no_grad()
+    def generate_cuda_graph(self, images, start_token_id, max_new_tokens=100, eos_token_id=None, temperature=1.0):
+        self.eval()
+        B = images.size(0)
+        device = images.device
+
+        memory, (H, W) = self.encoder(images)
+        memory = memory + self.pos_encoder(H, W)
+
+        inference_params = InferenceParams(max_seqlen=max_new_tokens, max_batch_size=B)
+        cross_attn_caches =[{} for _ in range(len(self.decoder.blocks))]
+
+        static_current_tokens = torch.full((B, 1), start_token_id, dtype=torch.long, device=device)
+        static_step = torch.zeros((1,), dtype=torch.long, device=device)
+        static_next_token = torch.zeros_like(static_current_tokens)
+
+        def capture_step():
+            logits = self.decoder(
+                memory=memory, 
+                tgt=static_current_tokens, 
+                step=static_step,
+                inference_params=inference_params,
+                cross_attn_caches=cross_attn_caches
+            )
+            next_token_logits = logits[:, -1, :] / temperature
+            next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+            static_next_token.copy_(next_token)
+
+        capture_step()
+        generated_tokens =[static_next_token.clone()]
+        static_current_tokens.copy_(static_next_token)
+        static_step.add_(1)
+        inference_params.seqlen_offset += 1
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                capture_step()
+        torch.cuda.current_stream().wait_stream(s)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            capture_step()
+
+        for _ in range(1, max_new_tokens):
+            g.replay()
+
+            next_token_clone = static_next_token.clone()
+            generated_tokens.append(next_token_clone)
+            
+            if eos_token_id is not None and (next_token_clone == eos_token_id).all():
+                break
+
+            static_current_tokens.copy_(static_next_token)
+            static_step.add_(1)
+
+            inference_params.seqlen_offset += 1 
+
+        return torch.cat(generated_tokens, dim=1)
