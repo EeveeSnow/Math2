@@ -138,8 +138,9 @@ class MambaDecoder(nn.Module):
             seq_len = tgt.size(1)
             x = x + self.pos[:, :seq_len]
         else:
-            x = x + self.pos[:, step : step + 1]
-            # x = x + self.pos[:, step] cuda graph optimizations
+            # x = x + self.pos[:, step : step + 1]
+            #  cuda graph optimizations
+            x = x + self.pos[:, step]
         x = x.contiguous() 
         if cross_attn_caches is None:
             cross_attn_caches = [None] * len(self.blocks)
@@ -193,6 +194,7 @@ class SwinMambaTex(nn.Module):
 
         current_tokens = torch.full((B, 1), start_token_id, dtype=torch.long, device=device)
         generated_tokens = []
+        is_finished = torch.zeros(B, dtype=torch.bool, device=device)
 
         for step in range(max_new_tokens):
             logits = self.decoder(
@@ -205,11 +207,14 @@ class SwinMambaTex(nn.Module):
 
             next_token_logits = logits[:, -1, :] / temperature
             next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+            
             generated_tokens.append(next_token)
             current_tokens = next_token
 
-            if eos_token_id is not None and (next_token == eos_token_id).all():
-                break
+            if eos_token_id is not None:
+                is_finished |= (next_token.squeeze(-1) == eos_token_id)
+                if is_finished.all():
+                    break
             
             inference_params.seqlen_offset += 1
 
@@ -311,11 +316,25 @@ class SwinMambaTex(nn.Module):
         memory = memory + self.pos_encoder(H, W)
 
         inference_params = InferenceParams(max_seqlen=max_new_tokens, max_batch_size=B)
+
+        dummy_input = torch.empty(1, memory.size(-1), device=device, dtype=memory.dtype)
+        cache_dtype = self.decoder.blocks[0].q_proj(dummy_input).dtype
+        
+        for blk in self.decoder.blocks:
+            layer_idx = blk.ssm1.layer_idx
+            inference_params.key_value_memory_dict[layer_idx] = blk.ssm1.allocate_inference_cache(
+                batch_size=B,
+                max_seqlen=max_new_tokens,
+                dtype=cache_dtype
+            )
+            
         cross_attn_caches =[{} for _ in range(len(self.decoder.blocks))]
 
         static_current_tokens = torch.full((B, 1), start_token_id, dtype=torch.long, device=device)
         static_step = torch.zeros((1,), dtype=torch.long, device=device)
         static_next_token = torch.zeros_like(static_current_tokens)
+
+        
 
         def capture_step():
             logits = self.decoder(

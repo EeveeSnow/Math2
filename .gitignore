@@ -8,3 +8,5 @@ __pycache__
 version1_learner.zip
 .gradio/certificate.pem
 /torch_compile_cache
+swin_mamba_light.html
+light_theme_architecture.html

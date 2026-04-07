@@ -144,7 +144,7 @@ def predict_latex(image, model, DEVICE, vocab):
         images=img_tensor, 
         start_token_id=1,
         eos_token_id=2,
-        beam_size=3,
+        beam_size=5,
         max_new_tokens=256)
     latex_str = [decode_tokens(vocab, predictions[0][0]), decode_tokens(vocab, predictions[0][1]), decode_tokens(vocab, predictions[0][2])]
     print(latex_str)

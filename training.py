@@ -9,10 +9,11 @@ from torch.utils.data import DataLoader
 from functools import partial
 from metrics import levenshtein
 from typing import List
-from model_mamba_1layer import SwinMambaTex as Im2LatexModel
-# from model_conv import SwinGConvTex as Im2LatexModel
-# from model_transformer import SwinTransformerTex as Im2LatexModel
+from model_mamba_1layer import SwinMambaTex
+from model_conv import SwinGConvTex
+from model_transformer import SwinTransformerTex
 from wraper import MathWritingDataset, Vocabulary, encode_batch
+import argparse
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = "./torch_compile_cache"
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -31,10 +32,6 @@ MIN_LR = 1e-6
 WARMUP_RATIO = 0.10  
 MAX_LEN = 512
 SAVE_EVERY = 1
-CHECKPOINT_PATH = "checkpoints/last_checkpoint.pt"
-BEST_MODEL_PATH = "checkpoints/best_model.pt"
-LOG_FILE_STEP = "training_step_log_mamba.csv"
-LOG_FILE_EPOCH = "training_epoch_log_mamba.csv"
 LOG_STEP_INTERVAL = 100
 
 PAD = 0
@@ -114,7 +111,7 @@ def build_scheduler(optimizer, total_steps: int, warmup_steps: int):
 # ======================
 # TRAIN
 # ======================
-def train():
+def train(model_type: str) -> None:
     os.makedirs("checkpoints", exist_ok=True)
     
     ds = load_dataset("deepcopy/MathWriting-Human")
@@ -143,8 +140,12 @@ def train():
         prefetch_factor=4, collate_fn=collate_fn_l
     )
 
-
-    model = Im2LatexModel(len(vocab)).to(DEVICE)
+    if model_type == "conv":
+        model = SwinGConvTex(len(vocab)).to(DEVICE)
+    elif model_type == "mamba":
+        model = SwinMambaTex(len(vocab)).to(DEVICE)
+    elif model_type == "transformer":
+        model = SwinTransformerTex(len(vocab)).to(DEVICE)
     steps_per_epoch   = len(train_loader)
 
 
@@ -258,6 +259,7 @@ def train():
         n_samples     = 0
 
         with torch.no_grad():
+            # model.decoder = torch.compile(model.decoder, mode="reduce-overhead")
             for batch in tqdm(val_loader, desc=f"  Val  {epoch}", leave=False):
                 images   = batch["image"].to(DEVICE, non_blocking=True)
                 captions = batch["captions"].to(DEVICE, non_blocking=True)
@@ -347,9 +349,16 @@ def train():
         save_checkpoint(state, is_best)
 
         if epoch % SAVE_EVERY == 0:
-            torch.save(state, f"checkpoints/epoch_{epoch:03d}.pt")
+            torch.save(state, f"checkpoints/{model_type}/epoch_{epoch:03d}.pt")
 
         model.train()
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="")
+    parser.add_argument("model", help="conv/mamba/transformer")
+    args = parser.parse_args()
+    CHECKPOINT_PATH = f"checkpoints/{args.model}/last_checkpoint.pt"
+    BEST_MODEL_PATH = f"checkpoints/{args.model}/best_model.pt"
+    LOG_FILE_STEP = f"training_step_log_{args.model}.csv"
+    LOG_FILE_EPOCH = f"training_epoch_log_{args.model}.csv"
+    train(model_type = args.model)
