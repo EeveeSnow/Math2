@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset
 from tqdm import tqdm
 
-from model_mamba_2layer import SwinMambaTex as Im2LatexModel
+from old.model_mamba_2layer import SwinMambaTex as Im2LatexModel
 from wraper import MathWritingDataset, Vocabulary, encode_batch
 from metrics import levenshtein
 

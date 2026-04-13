@@ -5,9 +5,6 @@ PAD = 0
 SOS = 1
 EOS = 2
 
-# ======================
-# METRICS
-# ======================
 def strip_eos(seq):
     seq = seq.tolist()
     return seq[:seq.index(EOS)] if EOS in seq else seq

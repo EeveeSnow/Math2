@@ -1,14 +1,14 @@
 from torchinfo import summary
 import torch
-from model_mamba_1layer import SwinMambaTex
-from model_conv import SwinGConvTex
-from model_transformer import SwinTransformerTex
+from models.model_MOE import SwinMoETex
+from models.model_conv import SwinGConvTex
+from models.model_transformer import SwinTransformerTex
 
 device = "cuda"
-vocab_size = 230
+vocab_size = 256
 B, T = 1, 100
 
-model = SwinMambaTex(vocab_size).to(device, dtype=torch.bfloat16)
+model = SwinMoETex(vocab_size).to(device, dtype=torch.bfloat16)
 
 
 print(summary(

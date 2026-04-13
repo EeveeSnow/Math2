@@ -6,13 +6,15 @@ import csv
 import os
 from datasets import load_dataset
 from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
 from functools import partial
 from metrics import levenshtein
 from typing import List
-from model_mamba_1layer import SwinMambaTex
-from model_conv import SwinGConvTex
-from model_transformer import SwinTransformerTex
-from wraper import MathWritingDataset, Vocabulary, encode_batch
+from models.model_mamba import SwinMambaTex
+from models.model_conv import SwinGConvTex
+from models.model_transformer import SwinTransformerTex
+from models.model_MOE import SwinMoETex
+from wraper import MathWritingDataset, Vocabulary
 import argparse
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = "./torch_compile_cache"
@@ -25,11 +27,11 @@ torch.backends.cudnn.allow_tf32 = True
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 12
 ACCUMULATION_STEPS = 4 
-EPOCHS = 20
-DECODER_LR = 2e-4
+EPOCHS = 10
+DECODER_LR = 1e-5 # 1e-4
 SWIN_LR = 2e-5
 MIN_LR = 1e-6
-WARMUP_RATIO = 0.10  
+WARMUP_RATIO = 0  # 0.10
 MAX_LEN = 512
 SAVE_EVERY = 1
 LOG_STEP_INTERVAL = 100
@@ -84,11 +86,16 @@ def save_checkpoint(state: dict, is_best: bool):
         torch.save(state, BEST_MODEL_PATH)
 
 
-def collate_fn(batch, vocab):
+def collate_fn(batch):
     images = torch.stack([item["image"] for item in batch])
-    latexs = [item["latex"] for item in batch]
-    captions = encode_batch(latexs, vocab) 
-    return {"image": images, "captions": captions}
+    captions = [item["caption"] for item in batch]
+    padded_captions = pad_sequence(
+        captions, 
+        batch_first=True, 
+        padding_value=PAD
+    )
+    return {"image": images, "captions": padded_captions}
+
 
 def build_scheduler(optimizer, total_steps: int, warmup_steps: int):
     warm = torch.optim.lr_scheduler.LinearLR(
@@ -124,19 +131,20 @@ def train(model_type: str) -> None:
         vocab = Vocabulary(freq_threshold=2)
         vocab.build_vocab([sample["latex"] for sample in ds["train"]])
 
-    collate_fn_l = partial(collate_fn, vocab=vocab)
+    collate_fn_l = partial(collate_fn)
 
-    train_dataset = MathWritingDataset(ds["train"], image_size=(384, 384))
-    val_dataset = MathWritingDataset(ds["val"], image_size=(384, 384))
+    train_dataset = MathWritingDataset(ds["train"], vocab, image_size=(384, 384))
+    val_dataset = MathWritingDataset(ds["val"], vocab, image_size=(384, 384))
     
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
         num_workers=8, pin_memory=True, persistent_workers=True, 
         prefetch_factor=4, collate_fn=collate_fn_l
     )
+    
     val_loader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE, shuffle=False, 
-        num_workers=4, pin_memory=True, persistent_workers=True, 
+        num_workers=8, pin_memory=True, persistent_workers=True, 
         prefetch_factor=4, collate_fn=collate_fn_l
     )
 
@@ -146,6 +154,8 @@ def train(model_type: str) -> None:
         model = SwinMambaTex(len(vocab)).to(DEVICE)
     elif model_type == "transformer":
         model = SwinTransformerTex(len(vocab)).to(DEVICE)
+    elif model_type == "MoE":
+        model = SwinMoETex(len(vocab)).to(DEVICE)
     steps_per_epoch   = len(train_loader)
 
 
@@ -158,7 +168,7 @@ def train(model_type: str) -> None:
     global_step = 0
 
     if os.path.exists(CHECKPOINT_PATH):
-        print(f"--- Loading checkpoint ---")
+        print("--- Loading checkpoint ---")
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
         
         model.load_state_dict(clean_state_dict(checkpoint['model_state_dict']))
@@ -177,6 +187,13 @@ def train(model_type: str) -> None:
         best_val_loss = checkpoint['best_val_loss']
         global_step = checkpoint.get('global_step', (start_epoch-1) * (len(train_loader)//ACCUMULATION_STEPS))
         print(f"--- Resuming from Epoch {start_epoch} ---")
+        start_epoch = 0
+        optimizer = torch.optim.AdamW([
+            {"params": model.encoder.parameters(), "lr": SWIN_LR},
+            {"params": model.pos_encoder.parameters(), "lr": DECODER_LR},
+            {"params": model.decoder.parameters(), "lr": DECODER_LR},
+        ], weight_decay=0.05, fused=True)
+        scheduler = build_scheduler(optimizer, total_updates, warmup_updates)
     else:
         print("--- Starting training from scratch ---")
         model = torch.compile(model)
@@ -212,8 +229,10 @@ def train(model_type: str) -> None:
             targets  = captions[:, 1:]
 
             with autocast("cuda", dtype=AMP_DTYPE):
-                logits, _ = model(images, inp)
+                logits, aux_loss = model(images, inp)
                 loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+                if model_type == "MoE":
+                    loss += 0.02 * aux_loss
                 loss = loss / ACCUMULATION_STEPS
 
             scaler.scale(loss).backward()
@@ -267,11 +286,13 @@ def train(model_type: str) -> None:
                 targets  = captions[:, 1:]
 
                 with autocast("cuda", dtype=AMP_DTYPE):
-                    logits, _ = model(images, inp)
+                    logits, aux_loss = model(images, inp)
                     v_loss = criterion(
                         logits.reshape(-1, logits.size(-1)),
                         targets.reshape(-1),
                     )
+                    if model_type == "MoE":
+                        v_loss += 0.02 * aux_loss
 
                 val_losses.append(v_loss.item())
 
@@ -355,10 +376,13 @@ def train(model_type: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="")
-    parser.add_argument("model", help="conv/mamba/transformer")
+    parser.add_argument("model", help="conv/mamba/transformer/MoE")
     args = parser.parse_args()
-    CHECKPOINT_PATH = f"checkpoints/{args.model}/last_checkpoint.pt"
-    BEST_MODEL_PATH = f"checkpoints/{args.model}/best_model.pt"
-    LOG_FILE_STEP = f"training_step_log_{args.model}.csv"
-    LOG_FILE_EPOCH = f"training_epoch_log_{args.model}.csv"
-    train(model_type = args.model)
+    if args.model not in ["conv", "mamba", "transformer", "MoE"]:
+        raise "Model not supported"
+    else:
+        CHECKPOINT_PATH = f"checkpoints/{args.model}/last_checkpoint.pt"
+        BEST_MODEL_PATH = f"checkpoints/{args.model}/best_model.pt"
+        LOG_FILE_STEP = f"logs/training_step_log_{args.model}.csv"
+        LOG_FILE_EPOCH = f"logs/training_epoch_log_{args.model}.csv"
+        train(model_type = args.model)
