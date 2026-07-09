@@ -68,6 +68,8 @@ f(x)=x^2+2x+1
 | Hybrid      | 0.848       | 0.855    | 0.934 |
 | MoE Hybrid  | 0.856       | 0.859    | 0.939 |
 
+![Model evaluation graph](graph.png)
+
 The Transformer architecture achieved the highest overall accuracy, while Mamba-based models demonstrated stronger behavior on longer sequences.
 
 ## Repository Structure
